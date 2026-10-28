@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Timegrapher">
+<title>Timegrapher</title>
+<style>
+:root{--bg:#fff;--fg:#111;--mut:#667;--card:#f1f2f5;--a:#0a7cff;--b:#ff6a00}
+@media(prefers-color-scheme:dark){:root{--bg:#0e0f12;--fg:#eee;--mut:#9aa;--card:#1b1d22}}
+*{box-sizing:border-box}
+body{margin:0 auto;max-width:520px;padding:calc(16px + env(safe-area-inset-top)) 16px calc(24px + env(safe-area-inset-bottom));font-family:-apple-system,system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+h1{font-size:22px;margin:0 0 4px}
+p.s{color:var(--mut);font-size:14px;margin:0 0 14px}
+.row{display:flex;gap:10px;margin-bottom:12px}
+button,select{font-size:17px;padding:12px;border-radius:12px;border:0;background:var(--card);color:var(--fg)}
+button{flex:1;background:var(--a);color:#fff;font-weight:600}
+button.stop{background:#d33}
+select{flex:1}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
+.card{background:var(--card);border-radius:12px;padding:12px}
+.card small{color:var(--mut);display:block;font-size:12px}
+.card b{font-size:26px;font-variant-numeric:tabular-nums}
+canvas{width:100%;height:150px;background:var(--card);border-radius:12px;display:block;margin-bottom:6px}
+#msg{color:var(--mut);font-size:14px;min-height:20px;margin:6px 0 12px}
+.leg{font-size:12px;color:var(--mut);margin-bottom:12px}
+</style>
+</head>
+<body>
+<h1>Timegrapher</h1>
+<p class="s">Apoya el reloj sobre el micrófono del móvil (parte inferior) en una habitación silenciosa.</p>
+
+<div class="row">
+  <button id="go">Iniciar</button>
+  <select id="bph">
+    <option value="">BPH: auto</option>
+    <option>14400</option><option>18000</option><option>19800</option>
+    <option>21600</option><option>25200</option><option>28800</option><option>36000</option>
+  </select>
+</div>
+<div id="msg">Pulsa Iniciar y concede acceso al micrófono.</div>
+
+<div class="grid">
+  <div class="card"><small>BPH medido</small><b id="rBph">–</b></div>
+  <div class="card"><small>Marcha (s/día)</small><b id="rRate">–</b></div>
+  <div class="card"><small>Beat error (ms)</small><b id="rBe">–</b></div>
+  <div class="card"><small>Tics analizados</small><b id="rN">–</b></div>
+</div>
+
+<canvas id="cLevel"></canvas>
+<div class="leg">Señal (últimos 0,5 s) y umbral de detección.</div>
+<canvas id="cDev"></canvas>
+<div class="leg"><span style="color:var(--a)">●</span> tic &nbsp; <span style="color:var(--b)">●</span> tac — desviación de cada tic (±5 ms). Dos líneas separadas = beat error.</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const STD = [14400, 18000, 19800, 21600, 25200, 28800, 36000];
+const SECS = 20;
+let ctx, stream, proc, fs, ring, wi = 0, total = 0, timer = null;
+
+// ---core---
+function median(a) {
+  const s = Float64Array.from(a).sort();
+  return s[Math.floor(s.length / 2)];
+}
+function envelope(x, fs) {
+  const w = Math.max(1, Math.round(fs * 0.0005));
+  const c = new Float64Array(x.length + 1);
+  for (let i = 0; i < x.length; i++) c[i + 1] = c[i] + Math.abs(x[i]);
+  const env = new Float32Array(x.length);
+  for (let i = 0; i < x.length; i++) {
+    const a = Math.max(0, i - w), b = Math.min(x.length, i + w + 1);
+    env[i] = (c[b] - c[a]) / (b - a);
+  }
+  return env;
+}
+function threshold(env) {
+  const s = [];
+  for (let i = 0; i < env.length; i += 8) s.push(env[i]);
+  s.sort((a, b) => a - b);
+  const q = p => s[Math.min(s.length - 1, Math.floor(p * s.length))];
+  const med = q(0.5);
+  const dev = s.map(v => Math.abs(v - med)).sort((a, b) => a - b);
+  const mad = dev[Math.floor(dev.length / 2)];
+  const p999 = q(0.999);
+  return { thr: Math.max(med + 10 * mad, 0.2 * p999), p999 };
+}
+function detectTicks(env, thr, fs) {
+  const gap = Math.round(fs * 0.04), out = [];
+  let last = -1e9;
+  for (let i = 0; i < env.length; i++) {
+    if (env[i] > thr) { if (i - last > gap) out.push(i); last = i; }
+  }
+  return out;
+}
+function fit(k, t, keep) {
+  let n = 0, sk = 0, st = 0, skk = 0, skt = 0;
+  for (let i = 0; i < k.length; i++) if (keep[i]) {
+    n++; sk += k[i]; st += t[i]; skk += k[i] * k[i]; skt += k[i] * t[i];
+  }
+  const b = (n * skt - sk * st) / (n * skk - sk * sk);
+  return [(st - b * sk) / n, b, n];
+}
+function analyze(times, bphHint) {
+  if (times.length < 8) return { error: "Pocos tics detectados. Acerca más el reloj al micrófono." };
+  const t0 = times[0];
+  const t = times.map(v => v - t0);
+  const d = [];
+  for (let i = 0; i < t.length - 1; i++) d.push(t[i + 1] - t[i]);
+  const med = median(d);
+  if (med < 0.06 || med > 0.3) return { error: "No se reconoce un ritmo de reloj. Prueba en un sitio más silencioso." };
+  const bph = bphHint || STD.reduce((p, c) => Math.abs(c - 3600 / med) < Math.abs(p - 3600 / med) ? c : p);
+  const nominal = 3600 / bph;
+  const k = [0];
+  for (const x of d) k.push(k[k.length - 1] + Math.max(1, Math.round(x / med)));
+  let keep = t.map(() => true), a, b, n, res;
+  for (let p = 0; p < 2; p++) {
+    [a, b, n] = fit(k, t, keep);
+    res = t.map((v, i) => v - (a + b * k[i]));
+    const m = median(res);
+    keep = res.map(r => Math.abs(r - m) < 0.010);
+  }
+  const ev = [], od = [];
+  res.forEach((r, i) => { if (keep[i]) (k[i] % 2 ? od : ev).push(r); });
+  if (ev.length < 3 || od.length < 3) return { error: "Datos insuficientes, sigue midiendo." };
+  const mean = v => v.reduce((s, x) => s + x, 0) / v.length;
+  return {
+    bph: 3600 / b,
+    rate: (nominal / b - 1) * 86400,
+    beat: Math.abs(mean(ev) - mean(od)) * 1000,
+    n: ev.length + od.length,
+    k, res, keep
+  };
+}
+// ---end core---
+
+function snapshot() {
+  const n = Math.min(total, ring.length), x = new Float32Array(n);
+  const s = (wi - n + ring.length) % ring.length;
+  for (let i = 0; i < n; i++) x[i] = ring[(s + i) % ring.length];
+  return x;
+}
+function setup(c) {
+  const r = devicePixelRatio || 1;
+  c.width = c.clientWidth * r; c.height = c.clientHeight * r;
+  const g = c.getContext("2d"); g.setTransform(r, 0, 0, r, 0, 0);
+  g.clearRect(0, 0, c.clientWidth, c.clientHeight);
+  return g;
+}
+function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+function drawLevel(env, thr) {
+  const c = $("cLevel"), g = setup(c), W = c.clientWidth, H = c.clientHeight;
+  const n = Math.min(env.length, Math.round(fs * 0.5)), s = env.length - n;
+  if (n < 10) return;
+  let mx = thr * 2;
+  for (let i = s; i < env.length; i++) if (env[i] > mx) mx = env[i];
+  g.strokeStyle = css("--a"); g.lineWidth = 1.2; g.beginPath();
+  for (let px = 0; px < W; px++) {
+    const i0 = s + Math.floor(px / W * n), i1 = s + Math.floor((px + 1) / W * n);
+    let m = 0;
+    for (let i = i0; i < Math.max(i1, i0 + 1); i++) if (env[i] > m) m = env[i];
+    const y = H - 6 - (H - 12) * m / mx;
+    px ? g.lineTo(px, y) : g.moveTo(px, y);
+  }
+  g.stroke();
+  const ty = H - 6 - (H - 12) * thr / mx;
+  g.strokeStyle = css("--mut"); g.setLineDash([4, 4]);
+  g.beginPath(); g.moveTo(0, ty); g.lineTo(W, ty); g.stroke(); g.setLineDash([]);
+}
+function drawDev(r) {
+  const c = $("cDev"), g = setup(c), W = c.clientWidth, H = c.clientHeight;
+  g.strokeStyle = css("--mut"); g.globalAlpha = 0.4;
+  g.beginPath(); g.moveTo(0, H / 2); g.lineTo(W, H / 2); g.stroke(); g.globalAlpha = 1;
+  if (!r || r.error) return;
+  const kmax = r.k[r.k.length - 1] || 1;
+  r.res.forEach((v, i) => {
+    if (!r.keep[i]) return;
+    const y = H / 2 - Math.max(-5, Math.min(5, v * 1000)) / 5 * (H / 2 - 6);
+    g.fillStyle = css(r.k[i] % 2 ? "--b" : "--a");
+    g.beginPath(); g.arc(4 + r.k[i] / kmax * (W - 8), y, 2.5, 0, 7); g.fill();
+  });
+}
+
+function tick() {
+  const x = snapshot();
+  if (x.length < fs * 3) { $("msg").textContent = "Recogiendo datos…"; return; }
+  const env = envelope(x, fs);
+  const { thr, p999 } = threshold(env);
+  drawLevel(env, thr);
+  if (p999 < 0.002) { $("msg").textContent = "Señal muy débil: acerca el reloj al micrófono."; return; }
+  const times = detectTicks(env, thr, fs).map(i => i / fs);
+  const sel = parseInt($("bph").value) || null;
+  const r = analyze(times, sel);
+  drawDev(r);
+  if (r.error) { $("msg").textContent = r.error; return; }
+  $("msg").textContent = "Midiendo (ventana de los últimos " + SECS + " s)";
+  $("rBph").textContent = r.bph.toFixed(0);
+  $("rRate").textContent = (r.rate >= 0 ? "+" : "") + r.rate.toFixed(1);
+  $("rBe").textContent = r.beat.toFixed(2);
+  $("rN").textContent = r.n;
+}
+
+async function start() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 }
+    });
+  } catch (e) {
+    $("msg").textContent = "No se pudo acceder al micrófono (¿HTTPS y permisos?): " + e.message;
+    return;
+  }
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  await ctx.resume();
+  fs = ctx.sampleRate;
+  ring = new Float32Array(Math.round(fs * SECS)); wi = 0; total = 0;
+  const src = ctx.createMediaStreamSource(stream);
+  const h1 = ctx.createBiquadFilter(), h2 = ctx.createBiquadFilter();
+  for (const h of [h1, h2]) { h.type = "highpass"; h.frequency.value = 2000; h.Q.value = 0.707; }
+  proc = ctx.createScriptProcessor(4096, 1, 1);
+  proc.onaudioprocess = e => {
+    const d = e.inputBuffer.getChannelData(0);
+    for (let i = 0; i < d.length; i++) { ring[wi] = d[i]; wi = (wi + 1) % ring.length; }
+    total += d.length;
+  };
+  src.connect(h1); h1.connect(h2); h2.connect(proc); proc.connect(ctx.destination);
+  timer = setInterval(tick, 1000);
+  $("go").textContent = "Detener"; $("go").className = "stop";
+  $("msg").textContent = "Recogiendo datos…";
+}
+function stop() {
+  clearInterval(timer); timer = null;
+  try { proc.disconnect(); } catch (e) {}
+  stream && stream.getTracks().forEach(t => t.stop());
+  ctx && ctx.close();
+  $("go").textContent = "Iniciar"; $("go").className = "";
+  $("msg").textContent = "Detenido.";
+}
+$("go").onclick = () => timer ? stop() : start();
+drawDev(null);
+</script>
+</body>
+</html>
