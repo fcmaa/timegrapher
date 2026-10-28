@@ -18,6 +18,9 @@ button,select{font-size:17px;padding:12px;border-radius:12px;border:0;background
 button{flex:1;background:var(--a);color:#fff;font-weight:600}
 button.stop{background:#d33}
 select{flex:1}
+button.sec{background:var(--card);color:var(--fg);font-size:15px}
+button:disabled{opacity:.4}
+.opt{display:block;font-size:14px;color:var(--mut);margin:0 0 10px}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
 .card{background:var(--card);border-radius:12px;padding:12px}
 .card small{color:var(--mut);display:block;font-size:12px}
@@ -39,6 +42,11 @@ canvas{width:100%;height:150px;background:var(--card);border-radius:12px;display
     <option>21600</option><option>25200</option><option>28800</option><option>36000</option>
   </select>
 </div>
+<div class="row">
+  <button id="again" class="sec">Nueva medida</button>
+  <button id="dl" class="sec" disabled>Descargar resultado</button>
+</div>
+<label class="opt"><input type="checkbox" id="auto" checked> Parar automáticamente cuando la medida sea estable</label>
 <div id="msg">Pulsa Iniciar y concede acceso al micrófono.</div>
 
 <div class="grid">
@@ -58,6 +66,7 @@ const $ = id => document.getElementById(id);
 const STD = [14400, 18000, 19800, 21600, 25200, 28800, 36000];
 const SECS = 20;
 let ctx, stream, proc, fs, ring, wi = 0, total = 0, timer = null;
+let hist = [], last = null;
 
 // ---core---
 function median(a) {
@@ -195,11 +204,39 @@ function tick() {
   const r = analyze(times, sel);
   drawDev(r);
   if (r.error) { $("msg").textContent = r.error; return; }
-  $("msg").textContent = "Midiendo (ventana de los últimos " + SECS + " s)";
+  const el = total / fs;
+  hist.push(r); if (hist.length > 6) hist.shift();
+  last = { bph: r.bph, nominal: sel, rate: r.rate, beat: r.beat, n: r.n, secs: Math.min(el, SECS), fs: fs, auto: false };
+  show(last);
+  $("dl").disabled = false;
+  const sp = spread(hist);
+  const stable = el >= 12 && hist.length >= 6 && r.n >= 50 && sp.rate < 2 && sp.beat < 0.3;
+  if ($("auto").checked && stable) {
+    const m = k => hist.reduce((s, x) => s + x[k], 0) / hist.length;
+    last = Object.assign({}, last, { bph: m("bph"), rate: m("rate"), beat: m("beat"), auto: true });
+    show(last);
+    stop("Medida estable: finalizada automáticamente.");
+    return;
+  }
+  $("msg").textContent = hist.length >= 6
+    ? "Midiendo… variación de la marcha ±" + (sp.rate / 2).toFixed(1) + " s/día"
+    : "Midiendo… estabilizando";
+}
+function show(r) {
   $("rBph").textContent = r.bph.toFixed(0);
   $("rRate").textContent = (r.rate >= 0 ? "+" : "") + r.rate.toFixed(1);
   $("rBe").textContent = r.beat.toFixed(2);
   $("rN").textContent = r.n;
+}
+function spread(hs) {
+  const rg = k => Math.max(...hs.map(x => x[k])) - Math.min(...hs.map(x => x[k]));
+  return { rate: rg("rate"), beat: rg("beat") };
+}
+function resetView() {
+  hist = []; last = null;
+  $("dl").disabled = true;
+  for (const id of ["rBph", "rRate", "rBe", "rN"]) $(id).textContent = "–";
+  setup($("cLevel")); drawDev(null);
 }
 
 async function start() {
@@ -215,6 +252,7 @@ async function start() {
   await ctx.resume();
   fs = ctx.sampleRate;
   ring = new Float32Array(Math.round(fs * SECS)); wi = 0; total = 0;
+  resetView();
   const src = ctx.createMediaStreamSource(stream);
   const h1 = ctx.createBiquadFilter(), h2 = ctx.createBiquadFilter();
   for (const h of [h1, h2]) { h.type = "highpass"; h.frequency.value = 2000; h.Q.value = 0.707; }
@@ -229,15 +267,38 @@ async function start() {
   $("go").textContent = "Detener"; $("go").className = "stop";
   $("msg").textContent = "Recogiendo datos…";
 }
-function stop() {
+function stop(msg) {
   clearInterval(timer); timer = null;
   try { proc.disconnect(); } catch (e) {}
   stream && stream.getTracks().forEach(t => t.stop());
   ctx && ctx.close();
   $("go").textContent = "Iniciar"; $("go").className = "";
-  $("msg").textContent = "Detenido.";
+  $("msg").textContent = msg || "Detenido.";
 }
 $("go").onclick = () => timer ? stop() : start();
+$("again").onclick = () => { if (timer) stop(); start(); };
+$("dl").onclick = () => {
+  if (!last) return;
+  const d = new Date(), p = n => String(n).padStart(2, "0");
+  const stamp = d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + "_" + p(d.getHours()) + p(d.getMinutes());
+  const txt = [
+    "Timegrapher: resultado de la medida",
+    "Fecha: " + d.toLocaleString("es-ES"),
+    "BPH medido: " + last.bph.toFixed(0),
+    "BPH nominal: " + (last.nominal || "automático"),
+    "Marcha: " + (last.rate >= 0 ? "+" : "") + last.rate.toFixed(1) + " s/día",
+    "Beat error: " + last.beat.toFixed(2) + " ms",
+    "Tics analizados: " + last.n,
+    "Duración de la ventana: " + last.secs.toFixed(0) + " s",
+    "Parada: " + (last.auto ? "automática (medida estable)" : "manual"),
+    "Frecuencia de muestreo: " + last.fs + " Hz"
+  ].join("\n") + "\n";
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([txt], { type: "text/plain" }));
+  a.download = "timegrapher_" + stamp + ".txt";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+};
 drawDev(null);
 </script>
 </body>
