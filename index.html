@@ -103,13 +103,13 @@ function fit(k, t, keep) {
   return [(st - b * sk) / n, b, n];
 }
 function analyze(times, bphHint) {
-  if (times.length < 8) return { error: "Pocos tics detectados. Acerca más el reloj al micrófono." };
+  if (times.length < 8) return { error: "Pocos tics detectados (" + times.length + "). Acerca más el reloj al micrófono." };
   const t0 = times[0];
   const t = times.map(v => v - t0);
   const d = [];
   for (let i = 0; i < t.length - 1; i++) d.push(t[i + 1] - t[i]);
   const med = median(d);
-  if (med < 0.06 || med > 0.3) return { error: "No se reconoce un ritmo de reloj. Prueba en un sitio más silencioso." };
+  if (med < 0.06 || med > 0.3) return { error: "No se reconoce un ritmo de reloj (" + times.length + " tics, intervalo mediano " + (med * 1000).toFixed(0) + " ms). Prueba en un sitio más silencioso o acerca el reloj." };
   const bph = bphHint || STD.reduce((p, c) => Math.abs(c - 3600 / med) < Math.abs(p - 3600 / med) ? c : p);
   const nominal = 3600 / bph;
   const k = [0];
@@ -119,11 +119,11 @@ function analyze(times, bphHint) {
     [a, b, n] = fit(k, t, keep);
     res = t.map((v, i) => v - (a + b * k[i]));
     const m = median(res);
-    keep = res.map(r => Math.abs(r - m) < 0.010);
+    keep = res.map(r => Math.abs(r - m) < 0.015);
   }
   const ev = [], od = [];
   res.forEach((r, i) => { if (keep[i]) (k[i] % 2 ? od : ev).push(r); });
-  if (ev.length < 3 || od.length < 3) return { error: "Datos insuficientes, sigue midiendo." };
+  if (ev.length < 3 || od.length < 3) return { error: "Datos insuficientes (" + times.length + " tics, intervalo mediano " + (med * 1000).toFixed(0) + " ms), sigue midiendo." };
   const mean = v => v.reduce((s, x) => s + x, 0) / v.length;
   return {
     bph: 3600 / b,
@@ -189,7 +189,7 @@ function tick() {
   const env = envelope(x, fs);
   const { thr, p999 } = threshold(env);
   drawLevel(env, thr);
-  if (p999 < 0.002) { $("msg").textContent = "Señal muy débil: acerca el reloj al micrófono."; return; }
+  if (p999 < 0.0003) { $("msg").textContent = "Señal muy débil (nivel " + p999.toExponential(1) + "): acerca el reloj al micrófono."; return; }
   const times = detectTicks(env, thr, fs).map(i => i / fs);
   const sel = parseInt($("bph").value) || null;
   const r = analyze(times, sel);
