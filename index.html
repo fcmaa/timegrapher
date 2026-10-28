@@ -20,6 +20,12 @@ button.stop{background:#d33}
 select{flex:1}
 button.sec{background:var(--card);color:var(--fg);font-size:15px}
 button:disabled{opacity:.4}
+input[type=text]{width:100%;font-size:16px;padding:12px;border-radius:12px;border:0;background:var(--card);color:var(--fg);margin-bottom:10px}
+h2{font-size:18px;margin:20px 0 8px}
+.item{background:var(--card);border-radius:12px;padding:10px 12px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:14px}
+.item b{font-size:17px;font-variant-numeric:tabular-nums}
+.item small{color:var(--mut);display:block}
+.item button{flex:none;background:none;color:var(--mut);padding:0 8px;font-size:22px}
 .opt{display:block;font-size:14px;color:var(--mut);margin:0 0 10px}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
 .card{background:var(--card);border-radius:12px;padding:12px}
@@ -42,9 +48,11 @@ canvas{width:100%;height:150px;background:var(--card);border-radius:12px;display
     <option>21600</option><option>25200</option><option>28800</option><option>36000</option>
   </select>
 </div>
+<input type="text" id="note" placeholder="Nota (reloj, posición…)" maxlength="60">
 <div class="row">
   <button id="again" class="sec">Nueva medida</button>
-  <button id="dl" class="sec" disabled>Descargar resultado</button>
+  <button id="save" class="sec" disabled>Guardar</button>
+  <button id="dl" class="sec" disabled>Descargar</button>
 </div>
 <label class="opt"><input type="checkbox" id="auto" checked> Parar automáticamente cuando la medida sea estable</label>
 <div id="msg">Pulsa Iniciar y concede acceso al micrófono.</div>
@@ -60,6 +68,15 @@ canvas{width:100%;height:150px;background:var(--card);border-radius:12px;display
 <div class="leg">Señal (últimos 0,5 s) y umbral de detección.</div>
 <canvas id="cDev"></canvas>
 <div class="leg"><span style="color:var(--a)">●</span> tic &nbsp; <span style="color:var(--b)">●</span> tac — desviación de cada tic (±5 ms). Dos líneas separadas = beat error.</div>
+
+<h2>Historial</h2>
+<canvas id="cHist" style="display:none"></canvas>
+<div class="leg" id="histLeg"></div>
+<div id="list"></div>
+<div class="row">
+  <button id="csv" class="sec">Exportar CSV</button>
+  <button id="clear" class="sec">Borrar todo</button>
+</div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -208,14 +225,14 @@ function tick() {
   hist.push(r); if (hist.length > 6) hist.shift();
   last = { bph: r.bph, nominal: sel, rate: r.rate, beat: r.beat, n: r.n, secs: Math.min(el, SECS), fs: fs, auto: false };
   show(last);
-  $("dl").disabled = false;
+  syncButtons();
   const sp = spread(hist);
   const stable = el >= 12 && hist.length >= 6 && r.n >= 50 && sp.rate < 2 && sp.beat < 0.3;
   if ($("auto").checked && stable) {
     const m = k => hist.reduce((s, x) => s + x[k], 0) / hist.length;
     last = Object.assign({}, last, { bph: m("bph"), rate: m("rate"), beat: m("beat"), auto: true });
     show(last);
-    stop("Medida estable: finalizada automáticamente.");
+    stop("Medida estable: finalizada automáticamente. Pulsa Guardar para añadirla al historial.");
     return;
   }
   $("msg").textContent = hist.length >= 6
@@ -234,9 +251,102 @@ function spread(hs) {
 }
 function resetView() {
   hist = []; last = null;
-  $("dl").disabled = true;
+  saved = false; syncButtons();
   for (const id of ["rBph", "rRate", "rBe", "rN"]) $(id).textContent = "–";
   setup($("cLevel")); drawDev(null);
+}
+
+const KEY = "timegrapher.history.v1";
+let entries = [], saved = false;
+
+function loadEntries() {
+  try {
+    const v = JSON.parse(localStorage.getItem(KEY) || "[]");
+    entries = Array.isArray(v) ? v : [];
+  } catch (e) { entries = []; }
+}
+function persist() {
+  try { localStorage.setItem(KEY, JSON.stringify(entries)); return true; }
+  catch (e) { $("msg").textContent = "No se pudo guardar en el navegador (¿modo privado?)."; return false; }
+}
+function syncButtons() {
+  $("dl").disabled = !last;
+  $("save").disabled = !last || saved;
+}
+function saveCurrent() {
+  if (!last || saved) return;
+  entries.unshift({
+    id: Date.now(), ts: new Date().toISOString(), note: $("note").value.trim(),
+    bph: last.bph, nominal: last.nominal, rate: last.rate, beat: last.beat,
+    n: last.n, secs: last.secs, auto: last.auto
+  });
+  if (entries.length > 200) entries.length = 200;
+  if (persist()) { saved = true; $("msg").textContent = "Guardado en el historial."; }
+  syncButtons();
+  renderEntries();
+}
+function renderEntries() {
+  const list = $("list");
+  list.textContent = "";
+  if (!entries.length) {
+    const e = document.createElement("div");
+    e.className = "leg"; e.textContent = "Aún no hay medidas guardadas.";
+    list.appendChild(e);
+  }
+  for (const e of entries) {
+    const it = document.createElement("div"); it.className = "item";
+    const l = document.createElement("div");
+    const t = document.createElement("b");
+    t.textContent = (e.rate >= 0 ? "+" : "") + e.rate.toFixed(1) + " s/día";
+    const s1 = document.createElement("small");
+    s1.textContent = new Date(e.ts).toLocaleString("es-ES", { dateStyle: "short", timeStyle: "short" }) + (e.note ? " · " + e.note : "");
+    const s2 = document.createElement("small");
+    s2.textContent = "beat error " + e.beat.toFixed(2) + " ms · " + e.bph.toFixed(0) + " BPH";
+    l.append(t, s1, s2);
+    const x = document.createElement("button");
+    x.textContent = "×"; x.setAttribute("aria-label", "Borrar medida");
+    x.onclick = () => { entries = entries.filter(y => y.id !== e.id); persist(); renderEntries(); };
+    it.append(l, x);
+    list.appendChild(it);
+  }
+  drawHistory();
+}
+function drawHistory() {
+  const c = $("cHist"), leg = $("histLeg");
+  const key = entries.length ? entries[0].note : "";
+  const pts = entries.filter(e => e.note === key).slice(0, 30).reverse();
+  if (pts.length < 2) { c.style.display = "none"; leg.textContent = ""; return; }
+  c.style.display = "block";
+  leg.textContent = "Marcha (s/día) de las últimas " + pts.length + " medidas" + (key ? " de «" + key + "»" : "") + ".";
+  const g = setup(c), W = c.clientWidth, H = c.clientHeight;
+  let lo = Math.min(0, ...pts.map(p => p.rate)), hi = Math.max(0, ...pts.map(p => p.rate));
+  if (hi - lo < 2) { hi += 1; lo -= 1; }
+  const X = i => 36 + i / (pts.length - 1) * (W - 48);
+  const Y = v => 10 + (hi - v) / (hi - lo) * (H - 20);
+  g.strokeStyle = css("--mut"); g.globalAlpha = 0.4;
+  g.beginPath(); g.moveTo(36, Y(0)); g.lineTo(W - 8, Y(0)); g.stroke(); g.globalAlpha = 1;
+  g.fillStyle = css("--mut"); g.font = "11px sans-serif";
+  g.fillText(hi.toFixed(0), 2, 14); g.fillText(lo.toFixed(0), 2, H - 6);
+  g.strokeStyle = css("--a"); g.lineWidth = 1.5; g.beginPath();
+  pts.forEach((p, i) => i ? g.lineTo(X(i), Y(p.rate)) : g.moveTo(X(i), Y(p.rate)));
+  g.stroke(); g.fillStyle = css("--a");
+  pts.forEach((p, i) => { g.beginPath(); g.arc(X(i), Y(p.rate), 3, 0, 7); g.fill(); });
+}
+function dlFile(name, text, type) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type: type }));
+  a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+function exportCsv() {
+  const q = s => '"' + String(s).replace(/"/g, '""') + '"';
+  const rows = ["fecha,nota,bph,bph_nominal,marcha_s_dia,beat_error_ms,tics,segundos,parada"];
+  for (const e of entries.slice().reverse()) {
+    rows.push([q(e.ts), q(e.note || ""), e.bph.toFixed(0), e.nominal || "", e.rate.toFixed(2),
+      e.beat.toFixed(3), e.n, e.secs.toFixed(0), e.auto ? "auto" : "manual"].join(","));
+  }
+  dlFile("timegrapher_historial.csv", rows.join("\n") + "\n", "text/csv");
 }
 
 async function start() {
@@ -293,13 +403,14 @@ $("dl").onclick = () => {
     "Parada: " + (last.auto ? "automática (medida estable)" : "manual"),
     "Frecuencia de muestreo: " + last.fs + " Hz"
   ].join("\n") + "\n";
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([txt], { type: "text/plain" }));
-  a.download = "timegrapher_" + stamp + ".txt";
-  document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  dlFile("timegrapher_" + stamp + ".txt", txt, "text/plain");
 };
+$("save").onclick = saveCurrent;
+$("csv").onclick = () => entries.length && exportCsv();
+$("clear").onclick = () => { if (entries.length && confirm("¿Borrar todo el historial?")) { entries = []; persist(); renderEntries(); } };
 drawDev(null);
+loadEntries();
+renderEntries();
 </script>
 </body>
 </html>
