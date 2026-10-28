@@ -59,7 +59,7 @@ canvas{width:100%;height:150px;background:var(--card);border-radius:12px;display
 
 <div class="grid">
   <div class="card"><small>BPH medido</small><b id="rBph">–</b></div>
-  <div class="card"><small>Marcha (s/día)</small><b id="rRate">–</b></div>
+  <div class="card"><small>Marcha (s/día)</small><b id="rRate">–</b><small id="rErr"></small></div>
   <div class="card"><small>Beat error (ms)</small><b id="rBe">–</b></div>
   <div class="card"><small>Tics analizados</small><b id="rN">–</b></div>
 </div>
@@ -81,9 +81,12 @@ canvas{width:100%;height:150px;background:var(--card);border-radius:12px;display
 <script>
 const $ = id => document.getElementById(id);
 const STD = [14400, 18000, 19800, 21600, 25200, 28800, 36000];
-const SECS = 20;
+const SECS = 40;          // ventana de análisis (s)
+const MIN_SECS = 30;      // mínimo de datos para dar la medida por buena
+const MAX_ERR = 1.5;      // incertidumbre máxima de la marcha (s/día) para parar
+
 let ctx, stream, proc, fs, ring, wi = 0, total = 0, timer = null;
-let hist = [], last = null;
+let last = null;
 
 // ---core---
 function median(a) {
@@ -103,7 +106,7 @@ function envelope(x, fs) {
 }
 function threshold(env) {
   const s = [];
-  for (let i = 0; i < env.length; i += 8) s.push(env[i]);
+  for (let i = 0; i < env.length; i += 32) s.push(env[i]);
   s.sort((a, b) => a - b);
   const q = p => s[Math.min(s.length - 1, Math.floor(p * s.length))];
   const med = q(0.5);
@@ -113,20 +116,33 @@ function threshold(env) {
   return { thr: Math.max(med + 10 * mad, 0.2 * p999), p999 };
 }
 function detectTicks(env, thr, fs) {
+  // Un tic = grupo de muestras sobre el umbral; su instante es el máximo de la envolvente.
   const gap = Math.round(fs * 0.04), out = [];
-  let last = -1e9;
+  let last = -1e9, best = -1, bestV = 0;
   for (let i = 0; i < env.length; i++) {
-    if (env[i] > thr) { if (i - last > gap) out.push(i); last = i; }
+    if (env[i] > thr) {
+      if (i - last > gap) { if (best >= 0) out.push(best); best = i; bestV = env[i]; }
+      else if (env[i] > bestV) { best = i; bestV = env[i]; }
+      last = i;
+    }
   }
+  if (best >= 0) out.push(best);
   return out;
 }
-function fit(k, t, keep) {
+function fit(k, t, keep, lo, hi) {
+  lo = lo === undefined ? -Infinity : lo; hi = hi === undefined ? Infinity : hi;
   let n = 0, sk = 0, st = 0, skk = 0, skt = 0;
-  for (let i = 0; i < k.length; i++) if (keep[i]) {
+  for (let i = 0; i < k.length; i++) if (keep[i] && k[i] >= lo && k[i] < hi) {
     n++; sk += k[i]; st += t[i]; skk += k[i] * k[i]; skt += k[i] * t[i];
   }
-  const b = (n * skt - sk * st) / (n * skk - sk * sk);
-  return [(st - b * sk) / n, b, n];
+  const sxx = skk - sk * sk / n;
+  if (n < 4 || !(sxx > 0)) return null;
+  const b = (skt - sk * st / n) / sxx, a = (st - b * sk) / n;
+  let ss = 0;
+  for (let i = 0; i < k.length; i++) if (keep[i] && k[i] >= lo && k[i] < hi) {
+    const r = t[i] - a - b * k[i]; ss += r * r;
+  }
+  return { a: a, b: b, n: n, se: Math.sqrt(ss / (n - 2) / sxx) };
 }
 function analyze(times, bphHint) {
   if (times.length < 8) return { error: "Pocos tics detectados (" + times.length + "). Acerca más el reloj al micrófono." };
@@ -140,22 +156,34 @@ function analyze(times, bphHint) {
   const nominal = 3600 / bph;
   const k = [0];
   for (const x of d) k.push(k[k.length - 1] + Math.max(1, Math.round(x / med)));
-  let keep = t.map(() => true), a, b, n, res;
+  const bad = () => ({ error: "Datos insuficientes (" + times.length + " tics, intervalo mediano " + (med * 1000).toFixed(0) + " ms), sigue midiendo." });
+  let keep = t.map(() => true), f, res;
   for (let p = 0; p < 2; p++) {
-    [a, b, n] = fit(k, t, keep);
-    res = t.map((v, i) => v - (a + b * k[i]));
+    f = fit(k, t, keep); if (!f) return bad();
+    res = t.map((v, i) => v - (f.a + f.b * k[i]));
     const m = median(res);
     keep = res.map(r => Math.abs(r - m) < 0.015);
   }
+  f = fit(k, t, keep); if (!f) return bad();
+  res = t.map((v, i) => v - (f.a + f.b * k[i]));
   const ev = [], od = [];
   res.forEach((r, i) => { if (keep[i]) (k[i] % 2 ? od : ev).push(r); });
-  if (ev.length < 3 || od.length < 3) return { error: "Datos insuficientes (" + times.length + " tics, intervalo mediano " + (med * 1000).toFixed(0) + " ms), sigue midiendo." };
+  if (ev.length < 3 || od.length < 3) return bad();
   const mean = v => v.reduce((s, x) => s + x, 0) / v.length;
+  const rateOf = g => (nominal / g.b - 1) * 86400;
+  const errOf = g => 86400 * g.se / g.b;
+  // Mitades independientes (sin solapamiento) para comprobar la consistencia
+  const kmid = k[k.length - 1] / 2;
+  const f1 = fit(k, t, keep, -Infinity, kmid), f2 = fit(k, t, keep, kmid, Infinity);
+  const halves = (f1 && f2 && f1.n >= 8 && f2.n >= 8)
+    ? { d: Math.abs(rateOf(f1) - rateOf(f2)), e: Math.hypot(errOf(f1), errOf(f2)) } : null;
   return {
-    bph: 3600 / b,
-    rate: (nominal / b - 1) * 86400,
+    bph: 3600 / f.b,
+    rate: rateOf(f),
+    err: errOf(f),
     beat: Math.abs(mean(ev) - mean(od)) * 1000,
     n: ev.length + od.length,
+    halves: halves,
     k, res, keep
   };
 }
@@ -222,37 +250,33 @@ function tick() {
   drawDev(r);
   if (r.error) { $("msg").textContent = r.error; return; }
   const el = total / fs;
-  hist.push(r); if (hist.length > 6) hist.shift();
-  last = { bph: r.bph, nominal: sel, rate: r.rate, beat: r.beat, n: r.n, secs: Math.min(el, SECS), fs: fs, auto: false };
+  last = { bph: r.bph, nominal: sel, rate: r.rate, err: r.err, beat: r.beat, n: r.n, secs: Math.min(el, SECS), fs: fs, auto: false };
   show(last);
   syncButtons();
-  const sp = spread(hist);
-  const stable = el >= 12 && hist.length >= 6 && r.n >= 50 && sp.rate < 2 && sp.beat < 0.3;
+  const hv = r.halves;
+  const consistent = !!hv && hv.d <= 2 + 2 * hv.e;
+  const stable = el >= MIN_SECS && r.n >= 100 && r.err <= MAX_ERR && consistent;
   if ($("auto").checked && stable) {
-    const m = k => hist.reduce((s, x) => s + x[k], 0) / hist.length;
-    last = Object.assign({}, last, { bph: m("bph"), rate: m("rate"), beat: m("beat"), auto: true });
-    show(last);
+    last.auto = true;
     stop("Medida estable: finalizada automáticamente. Pulsa Guardar para añadirla al historial.");
     return;
   }
-  $("msg").textContent = hist.length >= 6
-    ? "Midiendo… variación de la marcha ±" + (sp.rate / 2).toFixed(1) + " s/día"
-    : "Midiendo… estabilizando";
+  $("msg").textContent = el < MIN_SECS
+    ? "Midiendo… al menos " + Math.ceil(MIN_SECS - el) + " s más (±" + r.err.toFixed(1) + " s/día)"
+    : "Midiendo… ±" + r.err.toFixed(1) + " s/día" + (hv ? ", diferencia entre mitades " + hv.d.toFixed(1) + " s/día" : "");
 }
 function show(r) {
-  $("rBph").textContent = r.bph.toFixed(0);
+  $("rBph").textContent = r.bph.toFixed(1);
   $("rRate").textContent = (r.rate >= 0 ? "+" : "") + r.rate.toFixed(1);
+  $("rErr").textContent = r.err != null ? "± " + r.err.toFixed(1) + " s/día" : "";
   $("rBe").textContent = r.beat.toFixed(2);
   $("rN").textContent = r.n;
 }
-function spread(hs) {
-  const rg = k => Math.max(...hs.map(x => x[k])) - Math.min(...hs.map(x => x[k]));
-  return { rate: rg("rate"), beat: rg("beat") };
-}
 function resetView() {
-  hist = []; last = null;
+  last = null;
   saved = false; syncButtons();
   for (const id of ["rBph", "rRate", "rBe", "rN"]) $(id).textContent = "–";
+  $("rErr").textContent = "";
   setup($("cLevel")); drawDev(null);
 }
 
@@ -277,7 +301,7 @@ function saveCurrent() {
   if (!last || saved) return;
   entries.unshift({
     id: Date.now(), ts: new Date().toISOString(), note: $("note").value.trim(),
-    bph: last.bph, nominal: last.nominal, rate: last.rate, beat: last.beat,
+    bph: last.bph, nominal: last.nominal, rate: last.rate, err: last.err, beat: last.beat,
     n: last.n, secs: last.secs, auto: last.auto
   });
   if (entries.length > 200) entries.length = 200;
@@ -297,11 +321,11 @@ function renderEntries() {
     const it = document.createElement("div"); it.className = "item";
     const l = document.createElement("div");
     const t = document.createElement("b");
-    t.textContent = (e.rate >= 0 ? "+" : "") + e.rate.toFixed(1) + " s/día";
+    t.textContent = (e.rate >= 0 ? "+" : "") + e.rate.toFixed(1) + (e.err != null ? " ±" + e.err.toFixed(1) : "") + " s/día";
     const s1 = document.createElement("small");
     s1.textContent = new Date(e.ts).toLocaleString("es-ES", { dateStyle: "short", timeStyle: "short" }) + (e.note ? " · " + e.note : "");
     const s2 = document.createElement("small");
-    s2.textContent = "beat error " + e.beat.toFixed(2) + " ms · " + e.bph.toFixed(0) + " BPH";
+    s2.textContent = "beat error " + e.beat.toFixed(2) + " ms · " + e.bph.toFixed(1) + " BPH";
     l.append(t, s1, s2);
     const x = document.createElement("button");
     x.textContent = "×"; x.setAttribute("aria-label", "Borrar medida");
@@ -341,9 +365,9 @@ function dlFile(name, text, type) {
 }
 function exportCsv() {
   const q = s => '"' + String(s).replace(/"/g, '""') + '"';
-  const rows = ["fecha,nota,bph,bph_nominal,marcha_s_dia,beat_error_ms,tics,segundos,parada"];
+  const rows = ["fecha,nota,bph,bph_nominal,marcha_s_dia,marcha_incertidumbre,beat_error_ms,tics,segundos,parada"];
   for (const e of entries.slice().reverse()) {
-    rows.push([q(e.ts), q(e.note || ""), e.bph.toFixed(0), e.nominal || "", e.rate.toFixed(2),
+    rows.push([q(e.ts), q(e.note || ""), e.bph.toFixed(1), e.nominal || "", e.rate.toFixed(2), e.err != null ? e.err.toFixed(2) : "",
       e.beat.toFixed(3), e.n, e.secs.toFixed(0), e.auto ? "auto" : "manual"].join(","));
   }
   dlFile("timegrapher_historial.csv", rows.join("\n") + "\n", "text/csv");
@@ -373,7 +397,7 @@ async function start() {
     total += d.length;
   };
   src.connect(h1); h1.connect(h2); h2.connect(proc); proc.connect(ctx.destination);
-  timer = setInterval(tick, 1000);
+  timer = setInterval(tick, 2000);
   $("go").textContent = "Detener"; $("go").className = "stop";
   $("msg").textContent = "Recogiendo datos…";
 }
@@ -394,9 +418,9 @@ $("dl").onclick = () => {
   const txt = [
     "Timegrapher: resultado de la medida",
     "Fecha: " + d.toLocaleString("es-ES"),
-    "BPH medido: " + last.bph.toFixed(0),
+    "BPH medido: " + last.bph.toFixed(1),
     "BPH nominal: " + (last.nominal || "automático"),
-    "Marcha: " + (last.rate >= 0 ? "+" : "") + last.rate.toFixed(1) + " s/día",
+    "Marcha: " + (last.rate >= 0 ? "+" : "") + last.rate.toFixed(1) + (last.err != null ? " ± " + last.err.toFixed(1) : "") + " s/día",
     "Beat error: " + last.beat.toFixed(2) + " ms",
     "Tics analizados: " + last.n,
     "Duración de la ventana: " + last.secs.toFixed(0) + " s",
